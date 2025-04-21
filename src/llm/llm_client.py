@@ -6,8 +6,17 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Literal
-import litellm
 import re
+import litellm
+
+# For local Qwen models
+QWEN_AVAILABLE = True
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+    import torch
+    from src.llm.qwen_vl_utils import process_vision_info, format_qwen_messages
+except ImportError:
+    QWEN_AVAILABLE = False
 
 # Setup logging
 logging.basicConfig(
@@ -23,7 +32,7 @@ class LLMClient:
     def __init__(
         self, 
         model: str, 
-        api_key: str,
+        api_key: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
         max_cost: float = 10.0,  # Maximum cost in USD
@@ -64,7 +73,15 @@ class LLMClient:
         self.step_count = 0
         
         # Set the API key based on the model
-        if "gpt" in model.lower() or "openai" in model.lower():
+        if "Qwen2.5-VL" in model and (api_key is None or api_key == ""):
+            # Local Qwen model
+            if not QWEN_AVAILABLE:
+                raise ImportError("Qwen dependencies not available. Please install transformers and torch.")
+            self.provider = "qwen_local"
+            self.qwen_model = None
+            self.qwen_processor = None
+            # We'll load the model on first use to avoid memory usage if not needed
+        elif "gpt" in model.lower() or "openai" in model.lower():
             if api_key is not None and api_key != "":
                 os.environ["OPENAI_API_KEY"] = api_key
             self.provider = "openai"
@@ -122,6 +139,27 @@ class LLMClient:
         cost = (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1000
         return cost
 
+    def _load_qwen_model(self):
+        """Load the Qwen model and processor on first use"""
+        if self.qwen_model is None or self.qwen_processor is None:
+            self.file_logger.info(f"Loading Qwen model: {self.model}")
+            try:
+                # Extract the actual model name from our identifier
+                model_name = self.model
+                if '/' not in model_name:
+                    model_name = f"Qwen/{model_name}"
+                
+                # Load the model
+                self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_name, torch_dtype="auto", device_map="auto"
+                )
+                # Load the processor
+                self.qwen_processor = AutoProcessor.from_pretrained(model_name)
+                self.file_logger.info(f"Successfully loaded Qwen model and processor")
+            except Exception as e:
+                self.file_logger.error(f"Failed to load Qwen model: {str(e)}")
+                raise
+    
     async def generate_response(
         self, 
         system_message: Dict[str, str],
@@ -199,34 +237,93 @@ class LLMClient:
             
         self.file_logger.info(f"Messages: {json.dumps(messages_log, indent=2)}")
         
-        # Generate response using litellm
+        # Generate response using the appropriate provider
         try:
             start_time = time.time()
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens
-            )
+            
+            if self.provider == "qwen_local":
+                # Use local Qwen model
+                self._load_qwen_model()
+                
+                # Format messages for Qwen
+                if system_message is not None:
+                    # Add system message as the first user message
+                    messages = [{
+                        "role": "user",
+                        "content": system_message["content"]
+                    }] + messages
+                
+                # Process messages for Qwen
+                qwen_messages = format_qwen_messages(messages)
+                
+                # Apply chat template
+                text = self.qwen_processor.apply_chat_template(
+                    qwen_messages, tokenize=False, add_generation_prompt=True
+                )
+                
+                # Process images and videos
+                image_inputs, video_inputs = process_vision_info(messages)
+                
+                # Prepare inputs
+                inputs = self.qwen_processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                inputs = inputs.to(self.qwen_model.device)
+                
+                # Generate output
+                generated_ids = self.qwen_model.generate(
+                    **inputs, max_new_tokens=self.max_tokens,
+                    temperature=self.temperature
+                )
+                
+                # Decode output
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                response_text = self.qwen_processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )[0]
+                
+                # Estimate token counts for logging
+                input_tokens = len(inputs.input_ids[0])
+                output_tokens = len(generated_ids_trimmed[0])
+                
+                # No actual cost for local models, but log token counts
+                request_cost = 0.0
+                
+            else:
+                # Use litellm for API-based models
+                response = await litellm.acompletion(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens
+                )
+                
+                # Calculate and update cost
+                input_tokens = response.usage.prompt_tokens
+                output_tokens = response.usage.completion_tokens
+                request_cost = self._calculate_cost(input_tokens, output_tokens)
+                self.total_cost += request_cost
+                
+                # Check if we've exceeded the maximum cost
+                if self.total_cost > self.max_cost:
+                    raise Exception(f"Maximum cost limit (${self.max_cost}) exceeded. Total cost: ${self.total_cost:.2f}")
+                
+                # Extract response text
+                response_text = response.choices[0].message.content
+            
             response_time = time.time() - start_time
-            
-            # Calculate and update cost
-            input_tokens = response.usage.prompt_tokens
-            output_tokens = response.usage.completion_tokens
-            request_cost = self._calculate_cost(input_tokens, output_tokens)
-            self.total_cost += request_cost
-            
-            # Check if we've exceeded the maximum cost
-            if self.total_cost > self.max_cost:
-                raise Exception(f"Maximum cost limit (${self.max_cost}) exceeded. Total cost: ${self.total_cost:.2f}")
             
             # Log cost information
             self.file_logger.info(f"Request cost: ${request_cost:.4f}")
             self.file_logger.info(f"Total cost so far: ${self.total_cost:.2f}")
+            self.file_logger.info(f"Input tokens: {input_tokens}, Output tokens: {output_tokens}")
             logger.info(f"Total cost so far: ${self.total_cost:.2f}")
-            
-            # Extract response text
-            response_text = response.choices[0].message.content
             
             # Log response details
             self.file_logger.info(f"Response time: {response_time:.2f}s")
